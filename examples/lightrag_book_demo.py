@@ -262,8 +262,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--history-turns",
         type=int,
-        default=3,
-        help="Number of recent question-answer turns sent to the LLM in interactive mode",
+        default=0,
+        help=(
+            "Number of recent question-answer turns sent to the LLM in interactive "
+            "mode; 0 remembers the entire current session (default: 0)"
+        ),
     )
     return parser.parse_args()
 
@@ -275,9 +278,11 @@ async def query_rag(
     conversation_history: list[dict[str, str]] | None = None,
 ) -> str:
     """Run one retrieval query while sharing configuration across both modes."""
-    history_limit = args.history_turns * 2
+    history = conversation_history or []
     recent_history = (
-        (conversation_history or [])[-history_limit:] if history_limit else []
+        list(history)
+        if args.history_turns == 0
+        else history[-args.history_turns * 2 :]
     )
     return await rag.aquery(
         question,
@@ -297,6 +302,10 @@ async def interactive_chat(rag: LightRAG, args: argparse.Namespace) -> None:
     print("\nInteractive RAG chat is ready.")
     print("Enter a question, or use /exit, /quit, or 退出 to stop.")
     print("Press Ctrl+C to interrupt at any time.")
+    if args.history_turns == 0:
+        print("Memory: all turns in this run are remembered until you exit.")
+    else:
+        print(f"Memory: the latest {args.history_turns} turn(s) are remembered.")
 
     while True:
         try:
