@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_BOOK_PATH = REPO_ROOT / "book.txt"
 load_dotenv(REPO_ROOT / ".env", override=False)
 
 # Import after loading .env because LightRAG reads several defaults at import time.
@@ -27,10 +28,29 @@ from lightrag.llm.openai import (  # noqa: E402
     openai_complete_if_cache,
     openai_embed,
 )
-from lightrag.utils import EmbeddingFunc  # noqa: E402
+from lightrag.utils import EmbeddingFunc, Tokenizer  # noqa: E402
 
 
 LOCAL_EMBEDDING_DIM = 2048
+EXIT_COMMANDS = {"/exit", "/quit", "exit", "quit", "退出"}
+
+
+class UnicodeCodepointCodec:
+    """Provide deterministic local tokenization without downloading tiktoken data."""
+
+    def encode(self, content: str) -> list[int]:
+        return [ord(character) for character in content]
+
+    def decode(self, tokens: list[int]) -> str:
+        return "".join(chr(token) for token in tokens)
+
+
+def make_local_tokenizer() -> Tokenizer:
+    """Build a conservative tokenizer suitable for this Chinese learning demo."""
+    return Tokenizer(
+        model_name="unicode-codepoint-v1",
+        tokenizer=UnicodeCodepointCodec(),
+    )
 
 
 def configure_console() -> None:
@@ -182,8 +202,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--book",
         type=Path,
-        default=REPO_ROOT / "book.txt",
-        help="UTF-8 text file to index",
+        default=DEFAULT_BOOK_PATH,
+        help=f"UTF-8 text file to index (default: {DEFAULT_BOOK_PATH})",
     )
     parser.add_argument(
         "--working-dir",
@@ -234,7 +254,87 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print retrieved evidence without asking the LLM for a final answer",
     )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Keep the index open and accept questions until /exit or Ctrl+C",
+    )
+    parser.add_argument(
+        "--history-turns",
+        type=int,
+        default=3,
+        help="Number of recent question-answer turns sent to the LLM in interactive mode",
+    )
     return parser.parse_args()
+
+
+async def query_rag(
+    rag: LightRAG,
+    args: argparse.Namespace,
+    question: str,
+    conversation_history: list[dict[str, str]] | None = None,
+) -> str:
+    """Run one retrieval query while sharing configuration across both modes."""
+    history_limit = args.history_turns * 2
+    recent_history = (
+        (conversation_history or [])[-history_limit:] if history_limit else []
+    )
+    return await rag.aquery(
+        question,
+        param=QueryParam(
+            mode=args.mode,
+            only_need_context=args.only_context,
+            response_type="Chinese concise answer with evidence",
+            conversation_history=recent_history,
+            enable_rerank=False,
+        ),
+    )
+
+
+async def interactive_chat(rag: LightRAG, args: argparse.Namespace) -> None:
+    """Read questions repeatedly without rebuilding or reopening the index."""
+    conversation_history: list[dict[str, str]] = []
+    print("\nInteractive RAG chat is ready.")
+    print("Enter a question, or use /exit, /quit, or 退出 to stop.")
+    print("Press Ctrl+C to interrupt at any time.")
+
+    while True:
+        try:
+            question = input("\nYou> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nStopping interactive chat...")
+            return
+
+        if not question:
+            continue
+        if question.lower() in EXIT_COMMANDS:
+            print("Stopping interactive chat...")
+            return
+
+        try:
+            answer = await query_rag(
+                rag,
+                args,
+                question,
+                conversation_history=conversation_history,
+            )
+        except KeyboardInterrupt:
+            print("\nQuery interrupted. Stopping interactive chat...")
+            return
+        except Exception as exc:
+            print(f"\nQuery failed: {type(exc).__name__}: {exc}")
+            print("You can ask another question or enter /exit.")
+            continue
+
+        print("\nAssistant:\n")
+        print(answer)
+        if not args.only_context:
+            conversation_history.extend(
+                [
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": answer},
+                ]
+            )
 
 
 async def run(args: argparse.Namespace) -> None:
@@ -248,6 +348,7 @@ async def run(args: argparse.Namespace) -> None:
 
     rag = LightRAG(
         working_dir=str(working_dir),
+        tokenizer=make_local_tokenizer(),
         llm_model_func=make_llm_func(args.llm_model),
         llm_model_name=args.llm_model,
         llm_model_max_async=2,
@@ -293,18 +394,13 @@ async def run(args: argparse.Namespace) -> None:
                 raise RuntimeError(f"Indexing failed for track {track_id}: {details}")
             print(f"Indexing succeeded. Track ID: {track_id}")
 
-        print(f"\nQuestion: {args.query}")
-        answer = await rag.aquery(
-            args.query,
-            param=QueryParam(
-                mode=args.mode,
-                only_need_context=args.only_context,
-                response_type="Chinese concise answer with evidence",
-                enable_rerank=False,
-            ),
-        )
-        print("\nResult:\n")
-        print(answer)
+        if args.interactive:
+            await interactive_chat(rag, args)
+        else:
+            print(f"\nQuestion: {args.query}")
+            answer = await query_rag(rag, args, args.query)
+            print("\nResult:\n")
+            print(answer)
     finally:
         await rag.finalize_storages()
 
@@ -316,6 +412,8 @@ def main() -> None:
         raise SystemExit("--start-char cannot be negative")
     if args.max_chars is not None and args.max_chars <= 0:
         raise SystemExit("--max-chars must be greater than zero")
+    if args.history_turns < 0:
+        raise SystemExit("--history-turns cannot be negative")
     asyncio.run(run(args))
 
 
